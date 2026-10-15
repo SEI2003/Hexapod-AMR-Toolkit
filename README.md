@@ -194,7 +194,47 @@ waypoints:
     person_area: true
 ```
 
-アクション項目は、デフォルト値から変更されたものだけがウェイポイントごとに出力されます。
+新規アクション項目は、デフォルト値から変更されたものだけが出力されます。
+読み込んだYAMLに明示されていたデフォルト値や追加属性は、往復保存時にも維持します。
+
+### 通常起動版の地図座標とframe_id
+
+`run_editor.sh` はスクリプトのあるディレクトリへ移動して `main_all.py` を起動します。
+同じ場所に `venv/bin/activate` があれば使用します。
+`main.py` は別の複数地図レイヤー実装です。今回の地図・Waypoint YAML対応の検証対象は
+通常起動版です。両版のモデルは `src/core/map_coordinates.py` の座標処理を共有しますが、
+モジュール版のGUI・入出力処理全体の移植は行っていません。
+
+- 地図YAMLの `image`（YAMLからの相対パス可）、正の `resolution`、`origin: [x, y, 0]`
+  を使います。PGMから開く場合も、同じ名前の `.yaml` / `.yml` があれば読み込みます。
+  PGM単独の場合は以前の地図の解像度・原点を流用せず、Waypoint配置には地図YAMLが必要です。
+- 画像左上を `(0, 0)` とする連続座標を使用します。
+  `px=(x-origin_x)/resolution`、`py=height-(y-origin_y)/resolution` です。
+  セル中心は `(column+0.5, row+0.5)` ですが、Waypointへ自動の半セル補正は加えません。
+  描画時だけピクセルを丸め、保存する世界座標・角度は丸めません。
+- 地図を切り替えてもWaypointの世界座標を保持し、表示位置だけを再計算します。
+  読み込み・Waypoint編集ではPGMを書き換えません。明示的な地図出力では画素値を
+  正規化・二値化せず、元の `mode`、閾値、`negate`、原点なども維持します。
+- Waypoint形式 `1.0` / `1.1` を読み込めます。番号・角度・座標・既存属性・元のバージョンを
+  保持します。Format Editorで形式を変更した場合は、指定したフィールドとバージョンを使用します。
+  バージョンなしの旧形式や新規ファイルは、現在のFormat Editorのバージョンで保存します。
+- Waypointの `frame_id` がなければ、不明のまま保存します。新規作成時は地図の座標系が
+  明示されている場合だけ、その値を使用します。標準のNav2地図YAMLだけでは座標系名を
+  確定できません。地図の `frame_id` 拡張キー、または明示的な環境変数
+  `AMR_TOOLKIT_MAP_FRAME` を指定できます（地図内の値を優先）。例えば、地図が `map`
+  であると確認済みの場合に限り `AMR_TOOLKIT_MAP_FRAME=map ./run_editor.sh` と起動します。
+- 既知の座標系不一致は既存のエラー表示で拒否します。不明な場合は既存のステータス表示で
+  「一致を保証できない」と通知します。地図の `origin` はTF変換ではありません。
+  `camera_init` → `map` 等の自動変換と非ゼロyawの地図は未対応です。
+  非ゼロyawや無効な解像度の地図読込はエラーになります。
+
+テストはリポジトリ直下で実行できます。幾何変換のテスト単独ではQtを起動しません。
+全体のテストはQtのoffscreenを使い、画面表示とイベントループなしで操作・ファイル入出力を検証します。
+
+```bash
+python3 -m unittest discover -s tests -p test_map_coordinates.py -v
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v
+```
 
 ---
 

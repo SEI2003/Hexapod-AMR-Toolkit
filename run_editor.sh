@@ -1,4 +1,7 @@
 #!/bin/bash
-cd /home/kotantu-desktop/AMR_TOOLKIT
-source venv/bin/activate
-python3 main_all.py
+set -e
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+if [ -f venv/bin/activate ]; then
+    source venv/bin/activate
+fi
+exec python3 main_all.py "$@"

@@ -14,6 +14,10 @@ from PySide6.QtGui import (QPixmap, QImage, QWheelEvent, QPainter, QPen, QCursor
                           QDrag, QColor, QPolygon)  # QDragをQtGuiからインポート
 from enum import Enum
 from collections import OrderedDict
+from copy import deepcopy
+
+from src.core.map_coordinates import (MapGeometry, WorldPosition, check_frames,
+                                     finite_number, frame_id, validate_map_metadata)
 
 
 def read_pgm_file(path):
@@ -173,7 +177,7 @@ class DrawingMode(Enum):
     COST_PEN = 5
     COST_ERASER = 6
 
-class Waypoint:
+class Waypoint(WorldPosition):
     """ウェイポイントを管理するクラス"""
     counter = 0
     
@@ -205,35 +209,11 @@ class Waypoint:
         degrees = int(self.angle * 180 / np.pi)  # ラジアンを度に変換
         self.display_name = f"#{self.number:02d} ({self.x:.2f}, {self.y:.2f}) {degrees}°"
 
-    def update_metric_coordinates(self, origin_x, origin_y, resolution):
-        """ピクセル座標からメートル座標を計算"""
-        # 原点情報を保存
-        self._origin_x = origin_x
-        self._origin_y = origin_y
-        self.resolution = resolution
-        
-        # 原点からの相対位置をピクセルで計算
-        rel_x = (self.pixel_x - origin_x) / 20
-        rel_y = (-self.pixel_y + origin_y) / 20 # Y軸を反転
-
-        # メートル単位に変換
-        self.x = rel_x 
-        self.y = rel_y
-        self.update_display_name()
-
     def renumber(self, new_number):
         """ウェイポイントの番号を変更"""
         self.number = new_number
         self.name = f"Waypoint {self.number}"
         self.update_display_name()
-
-    def set_position(self, x, y):
-        """ピクセル座標を更新"""
-        self.pixel_x = x
-        self.pixel_y = y
-        if hasattr(self, '_origin_x') and hasattr(self, '_origin_y'):
-            # 既存の原点情報がある場合は座標を更新
-            self.update_metric_coordinates(self._origin_x, self._origin_y, self.resolution)
 
     def set_attribute(self, key, value):
         """属性を設定"""
@@ -244,7 +224,7 @@ class Waypoint:
         return self.attributes.get(key, default)
 
 
-class Landmark:
+class Landmark(WorldPosition):
     """名前付きランドマークを管理するクラス"""
     counter = 0
 
@@ -278,20 +258,6 @@ class Landmark:
     def update_display_name(self):
         degrees = int(self.angle * 180 / np.pi)
         self.display_name = f"{self.name} ({self.x:.2f}, {self.y:.2f}) {degrees}°"
-
-    def update_metric_coordinates(self, origin_x, origin_y, resolution):
-        self._origin_x = origin_x
-        self._origin_y = origin_y
-        self.resolution = resolution
-        self.x = (self.pixel_x - origin_x) / 20
-        self.y = (-self.pixel_y + origin_y) / 20
-        self.update_display_name()
-
-    def set_position(self, x, y):
-        self.pixel_x = x
-        self.pixel_y = y
-        if hasattr(self, '_origin_x') and hasattr(self, '_origin_y'):
-            self.update_metric_coordinates(self._origin_x, self._origin_y, self.resolution)
 
 class CustomScrollArea(QScrollArea):
     """カスタムスクロールエリアクラス
@@ -411,7 +377,8 @@ class DrawableLabel(QLabel):
         self.drag_start = None
         self.last_pos = None  # Add this line
         self.is_editing_angle = False
-        self._drag_offset = (0, 0)  # ドラッグ時に掴んだ位置との相対オフセット（滑らかな移動用）
+        self._drag_start_image = (0, 0)
+        self._drag_start_pixel = (0, 0)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # 矢印キーでの微調整用
 
     def set_drawing_mode(self, enabled):
@@ -459,7 +426,8 @@ class DrawableLabel(QLabel):
 
     def mouseDoubleClickEvent(self, event):
         """ウェイポイントをダブルクリックして編集モードの切り替え"""
-        if not self.parent_viewer or self.parent_viewer.drawing_mode != DrawingMode.NONE:
+        if (not self.parent_viewer or self.parent_viewer.map_geometry is None
+                or self.parent_viewer.drawing_mode != DrawingMode.NONE):
             return
         pos = event.position().toPoint()
         im_pos = self.parent_viewer.display_to_image_coords(pos)
@@ -523,6 +491,8 @@ class DrawableLabel(QLabel):
                 self.last_pos = pos
                 self.parent_viewer.draw_line(pos, pos)  # 点を描画
         elif self.edit_mode and (self.editing_waypoint or self.editing_landmark):
+            if event.button() != Qt.MouseButton.LeftButton:
+                return super().mousePressEvent(event)
             pos = event.position().toPoint()
             im_pos = self.parent_viewer.display_to_image_coords(pos)
             if im_pos is None:
@@ -538,13 +508,13 @@ class DrawableLabel(QLabel):
             else:
                 # 通常クリックは位置の移動。掴んだ位置との相対オフセットを保持して
                 # カーソル位置へジャンプさせず、滑らかに追従させる。
-                self._drag_offset = (editing_item.pixel_x - x, editing_item.pixel_y - y)
+                self._drag_start_image = (x, y)
+                self._drag_start_pixel = (editing_item.pixel_x, editing_item.pixel_y)
                 self.parent_viewer._edit_dragging = True
-                editing_item.set_position(x + self._drag_offset[0], y + self._drag_offset[1])
                 if self.parent_viewer:
                     self.parent_viewer.update_display()
                     if self.editing_waypoint:
-                        self.parent_viewer.waypoint_edited.emit(self.editing_waypoint)
+                        self.waypoint_edited.emit(self.editing_waypoint)
                     else:
                         self.parent_viewer.landmark_edited.emit(self.editing_landmark)
         else:
@@ -582,7 +552,8 @@ class DrawableLabel(QLabel):
                                 int(event.globalPosition().y())
                             )
                             QToolTip.showText(global_pos, tooltip.strip())
-                            return
+                            if not (self.edit_mode or self.is_setting_angle):
+                                return
                 
                 QToolTip.hideText()
 
@@ -607,7 +578,8 @@ class DrawableLabel(QLabel):
                 self.parent_viewer.draw_line(self.last_pos, pos)  # 線を描画
                 self.last_pos = pos
                 self.updateCursor()  # マウス移動時にカーソルを更新
-        elif self.edit_mode and (self.editing_waypoint or self.editing_landmark):
+        elif (self.edit_mode and (self.editing_waypoint or self.editing_landmark)
+              and event.buttons() & Qt.MouseButton.LeftButton):
             pos = event.position().toPoint()
             im_pos = self.parent_viewer.display_to_image_coords(pos)
             if im_pos is None:
@@ -624,12 +596,14 @@ class DrawableLabel(QLabel):
                 editing_item.set_angle(angle)
             else:
                 # 位置の更新（掴んだ相対オフセットを保持して滑らかに追従）
-                editing_item.set_position(x + self._drag_offset[0], y + self._drag_offset[1])
+                editing_item.set_position(
+                    self._drag_start_pixel[0] + (x - self._drag_start_image[0]),
+                    self._drag_start_pixel[1] + (y - self._drag_start_image[1]))
 
             if self.parent_viewer:
                 self.parent_viewer.update_display()
                 if self.editing_waypoint:
-                    self.parent_viewer.waypoint_edited.emit(self.editing_waypoint)
+                    self.waypoint_edited.emit(self.editing_waypoint)
                 else:
                     self.parent_viewer.landmark_edited.emit(self.editing_landmark)
         else:
@@ -667,7 +641,7 @@ class DrawableLabel(QLabel):
                 self.parent_viewer._edit_dragging = False
                 self.parent_viewer.update_display()
                 if self.editing_waypoint:
-                    self.parent_viewer.waypoint_edited.emit(self.editing_waypoint)
+                    self.waypoint_edited.emit(self.editing_waypoint)
                 else:
                     self.parent_viewer.landmark_edited.emit(self.editing_landmark)
         else:
@@ -693,7 +667,7 @@ class DrawableLabel(QLabel):
                 if self.parent_viewer:
                     self.parent_viewer.update_display()
                     if self.editing_waypoint:
-                        self.parent_viewer.waypoint_edited.emit(self.editing_waypoint)
+                        self.waypoint_edited.emit(self.editing_waypoint)
                     else:
                         self.parent_viewer.landmark_edited.emit(self.editing_landmark)
                 event.accept()
@@ -743,7 +717,7 @@ class DrawableLabel(QLabel):
                             waypoint.attributes = dialog.get_attributes()
                             self.parent_viewer.update_display()
                             if self.parent_viewer:
-                                self.parent_viewer.waypoint_edited.emit(waypoint)
+                                self.waypoint_edited.emit(waypoint)
                     break
 
 class Layer(QWidget):  
@@ -856,6 +830,11 @@ class ImageViewer(QWidget):
         self.grid_size = 50
         self.origin_point = None
         self.resolution = 0.05
+        self.map_geometry = None
+        self.map_metadata = {}
+        self.map_frame_id = None
+        self.waypoint_metadata = {}
+        self.waypoint_format_at_import = None
         self.map_origin = None            # ベース地図のワールド原点 [x, y]（YAMLのorigin）
         self.roadmap_resolution = None    # 路面マップの解像度（colored.json）
         self.roadmap_origin = None        # 路面マップのワールド原点 [x, y]（colored.json）
@@ -1503,6 +1482,22 @@ class ImageViewer(QWidget):
 
     def load_image(self, img_array, width, height):
         """PGM画像データを読み込んでPGMレイヤーに設定"""
+        # A bare image has no spatial metadata. Never reuse the previous map's.
+        self.map_geometry = None
+        self.map_metadata = {}
+        self.map_frame_id = None
+        self.map_origin = None
+        self.origin_point = None
+        self.origin_layer.pixmap = None
+        self.current_map_yaml_path = None
+        self.exit_edit_mode()
+        self.pgm_display.editing_landmark = None
+        self.pgm_display.temp_waypoint = None
+        self.pgm_display.temp_landmark = None
+        self.path_layer.pixmap = None
+        self.coord_label.hide()
+        for item in self.waypoints + self.landmarks:
+            item._geometry = None
         bytes_per_line = width
         q_img = QImage(img_array.data, width, height, bytes_per_line,
                     QImage.Format.Format_Grayscale8)
@@ -2063,6 +2058,9 @@ class ImageViewer(QWidget):
         """ウェイポイントを追加"""
         if not self.pgm_layer.pixmap:
             return
+        if self.map_geometry is None:
+            self.show_edit_message('先に地図YAMLを読み込んで解像度と原点を設定してください。')
+            return
 
         # 表示座標 -> 画像上のピクセル座標に変換
         im_pos = self.display_to_image_coords(pos)
@@ -2073,10 +2071,12 @@ class ImageViewer(QWidget):
         
         waypoint = Waypoint(x, y)
         
-        # 原点が設定されている場合は、メートル座標を計算
-        if self.origin_point:
-            origin_x, origin_y = self.origin_point
-            waypoint.update_metric_coordinates(origin_x, origin_y, self.resolution)
+        # New GUI points acquire world coordinates once.
+        waypoint.bind_map(self.map_geometry)
+        waypoint._last_edit_state = {'x': waypoint.x, 'y': waypoint.y, 'angle': waypoint.angle}
+        if not self.waypoints and self.waypoint_format_at_import is None:
+            if self.map_frame_id is not None:
+                self.waypoint_metadata['frame_id'] = self.map_frame_id
             
         self.waypoints.append(waypoint)
         self.pgm_display.temp_waypoint = waypoint
@@ -2111,9 +2111,8 @@ class ImageViewer(QWidget):
             return
 
         landmark = Landmark(im_pos.x(), im_pos.y())
-        if self.origin_point:
-            origin_x, origin_y = self.origin_point
-            landmark.update_metric_coordinates(origin_x, origin_y, self.resolution)
+        if self.map_geometry is not None:
+            landmark.bind_map(self.map_geometry)
 
         self.landmarks.append(landmark)
         self.pgm_display.temp_landmark = landmark
@@ -2131,9 +2130,8 @@ class ImageViewer(QWidget):
 
     def update_landmark(self, landmark):
         """ランドマークの更新（角度変更時）"""
-        if self.origin_point:
-            origin_x, origin_y = self.origin_point
-            landmark.update_metric_coordinates(origin_x, origin_y, self.resolution)
+        if self.map_geometry is not None:
+            landmark.bind_map(self.map_geometry)
         self.update_display()
         self.landmark_edited.emit(landmark)
 
@@ -2194,12 +2192,16 @@ class ImageViewer(QWidget):
             painter.drawPixmap(0, 0, self.path_layer.pixmap)
 
         # 5. ウェイポイントレイヤーを描画
-        if self.waypoints and self.waypoint_layer.visible:
+        if self.map_geometry is not None and self.waypoints and self.waypoint_layer.visible:
             painter.setOpacity(self.waypoint_layer.opacity)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             
             for waypoint in self.waypoints:
-                x, y = waypoint.pixel_x, waypoint.pixel_y
+                margin = WAYPOINT_SETTINGS['BASE_SIZE'] * 4
+                if not (-margin <= waypoint.pixel_x <= result.width() + margin
+                        and -margin <= waypoint.pixel_y <= result.height() + margin):
+                    continue
+                x, y = round(waypoint.pixel_x), round(waypoint.pixel_y)
                 base_size = WAYPOINT_SETTINGS['BASE_SIZE']
                 
                 # 編集中のウェイポイントは特別な表示
@@ -2287,7 +2289,7 @@ class ImageViewer(QWidget):
                 waypoint.hover_rect = hover_rect  # 後でホバー判定に使用
 
         # 6. ランドマークレイヤーを描画
-        if self.landmarks and self.landmark_layer.visible:
+        if self.map_geometry is not None and self.landmarks and self.landmark_layer.visible:
             painter.setOpacity(self.landmark_layer.opacity)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             font = self.font()
@@ -2296,7 +2298,10 @@ class ImageViewer(QWidget):
             painter.setFont(font)
 
             for landmark in self.landmarks:
-                x, y = landmark.pixel_x, landmark.pixel_y
+                if not (-100 <= landmark.pixel_x <= result.width() + 100
+                        and -100 <= landmark.pixel_y <= result.height() + 100):
+                    continue
+                x, y = round(landmark.pixel_x), round(landmark.pixel_y)
                 size = 9
                 is_editing = (self.pgm_display.edit_mode and
                               self.pgm_display.editing_landmark and
@@ -2513,7 +2518,7 @@ class ImageViewer(QWidget):
 
     def update_mouse_position(self, pos):
         """マウス位置の更新とラベル表示"""
-        if not self.pgm_layer.pixmap or not self.origin_point:
+        if not self.pgm_layer.pixmap or self.map_geometry is None:
             return
         # 表示座標からピクセル座標に変換
         im_pos = self.display_to_image_coords(pos)
@@ -2524,73 +2529,54 @@ class ImageViewer(QWidget):
         pixel_y = im_pos.y()
 
         # 原点からの相対位置を計算
-        origin_x, origin_y = self.origin_point
-        rel_x = (pixel_x - origin_x) / 20
-        rel_y = (origin_y - pixel_y) / 20
+        rel_x, rel_y = self.map_geometry.pixel_to_world(pixel_x, pixel_y)
         
         # 座標を表示（ピクセル座標と相対座標）
         self.coord_label.setText(f"Pixel: ({pixel_x}, {pixel_y})\nMetric: ({rel_x:.2f}, {rel_y:.2f})")
         self.coord_label.show()
 
     def load_yaml_file(self, file_path):
-        """YAMLファイルを読み込みorigin点を設定"""
-        try:
-            with open(file_path, 'r') as f:
-                yaml_data = yaml.safe_load(f)
+        """Apply spatial metadata to the current image; errors reach the caller."""
+        with open(file_path, 'r') as f:
+            self.apply_map_metadata(yaml.safe_load(f), file_path)
 
-            self.current_map_yaml_path = file_path
-
-            # 障害物膨張の占有判定に使うROS map YAMLの閾値を反映する
-            if 'occupied_thresh' in yaml_data:
-                self.inflation_occupied_thresh = float(yaml_data['occupied_thresh'])
-            if 'negate' in yaml_data:
-                self.inflation_negate = int(yaml_data['negate'])
-            self._inflation_params_key = None
-            self._planning_cost_key = None
-            if self.inflation_enabled:
-                self._inflation_timer.start()
-            if self.semantic_enabled:
-                self._semantic_timer.start()
-                
-            # YAMLファイルから直接originとresolutionを読み取る
-            if 'origin' in yaml_data:
-                origin = yaml_data['origin']
-                if len(origin) >= 2:
-                    # 解像度を保存
-                    self.resolution = float(yaml_data.get('resolution', 0.05))
-                    # ワールド原点を保存（路面マップとの原点合わせに使用）
-                    self.map_origin = (float(origin[0]), float(origin[1]))
-                    x_pixel = int(-origin[0] / self.resolution)
-                    y_pixel = int(-origin[1] / self.resolution)
-                    
-                    if self.pgm_layer.pixmap:
-                        height = self.pgm_layer.pixmap.height()
-                        y_pixel = height - y_pixel
-                    
-                    self.origin_point = (x_pixel, y_pixel)
-                    self.draw_origin_point()
-                    
-                    # 既存のウェイポイントの座標を更新
-                    self.update_all_waypoint_coordinates()
-                    print(f"Origin point set to: {self.origin_point} (resolution: {self.resolution})")
-                    print(f"Original coordinates: x={origin[0]}, y={origin[1]} meters")
-                
-        except Exception as e:
-            print(f"Error loading YAML file: {str(e)}")
-            import traceback
-            traceback.print_exc()
+    def apply_map_metadata(self, data, file_path=None):
+        resolution, origin = validate_map_metadata(data)
+        if not self.pgm_layer.pixmap:
+            raise ValueError('Load a map image before its metadata')
+        map_frame = frame_id(data.get('frame_id') or os.environ.get('AMR_TOOLKIT_MAP_FRAME'))
+        warning = check_frames(map_frame, self.waypoint_metadata.get('frame_id'))
+        geometry = MapGeometry(resolution, origin, self.pgm_layer.pixmap.width(),
+                               self.pgm_layer.pixmap.height())
+        self.current_map_yaml_path = file_path
+        self.map_metadata = deepcopy(data)
+        self.map_frame_id = map_frame
+        self.map_geometry = geometry
+        self.resolution = resolution
+        self.map_origin = origin[:2]
+        self.origin_point = geometry.world_to_pixel(0.0, 0.0)
+        self.inflation_occupied_thresh = float(data.get('occupied_thresh', 0.65))
+        self.inflation_negate = int(data.get('negate', 0))
+        self._inflation_params_key = None
+        self._planning_cost_key = None
+        self.update_all_waypoint_coordinates()
+        self.draw_origin_point()
+        if self.inflation_enabled:
+            self._inflation_timer.start()
+        if self.semantic_enabled:
+            self._semantic_timer.start()
+        if warning:
+            self.show_edit_message(warning)
 
     def update_all_waypoint_coordinates(self):
-        """全てのウェイポイントの座標を更新"""
-        if not self.origin_point:
+        """Reproject world positions; changing maps must never change x/y."""
+        if self.map_geometry is None:
             return
-            
-        origin_x, origin_y = self.origin_point
         for waypoint in self.waypoints:
-            waypoint.update_metric_coordinates(origin_x, origin_y, self.resolution)
-            self.waypoint_added.emit(waypoint)  # UIを更新
+            waypoint.bind_map(self.map_geometry)
+            self.waypoint_added.emit(waypoint)
         for landmark in self.landmarks:
-            landmark.update_metric_coordinates(origin_x, origin_y, self.resolution)
+            landmark.bind_map(self.map_geometry)
             self.landmark_edited.emit(landmark)
 
     def draw_origin_point(self):
@@ -2605,13 +2591,20 @@ class ImageViewer(QWidget):
 
         # 既存の描画をクリア
         self.origin_layer.pixmap.fill(Qt.GlobalColor.transparent)
+
+        # A switched map need not contain world zero. Avoid huge Qt integers.
+        origin_x, origin_y = self.origin_point
+        if not (-20 <= origin_x <= self.pgm_layer.pixmap.width() + 20
+                and -20 <= origin_y <= self.pgm_layer.pixmap.height() + 20):
+            self.update_display()
+            return
         
         # 原点マーカーを描画
         painter = QPainter(self.origin_layer.pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         
         # 原点の位置を取得
-        x, y = self.origin_point
+        x, y = map(round, self.origin_point)
         
         # クロスマーカーを描画
         marker_size = 20
@@ -3282,44 +3275,30 @@ class ImageViewer(QWidget):
         return pts
 
     def handle_waypoint_edited(self, waypoint):
-        """ウェイポイント編集時の処理"""
-        # 編集前の状態を保存
-        old_state = {
-            'pixel_x': waypoint.pixel_x,
-            'pixel_y': waypoint.pixel_y,
-            'angle': waypoint.angle
-        }
-
-        if self.origin_point:  # 原点が設定されている場合
-            origin_x, origin_y = self.origin_point
-            waypoint.update_metric_coordinates(origin_x, origin_y, self.resolution)
+        """Notify the list; only actual position/angle changes enter history."""
+        new_state = {'x': waypoint.x, 'y': waypoint.y, 'angle': waypoint.angle}
+        old_state = getattr(waypoint, '_last_edit_state', new_state)
+        waypoint._last_edit_state = new_state.copy()
         self.waypoint_edited.emit(waypoint)
         self.update_display()
-
-        # 編集後の状態を履歴に追加
-        new_state = {
-            'pixel_x': waypoint.pixel_x,
-            'pixel_y': waypoint.pixel_y,
-            'angle': waypoint.angle
-        }
-
-        self.add_to_history({
-            'type': 'waypoint_edit',
-            'waypoint': waypoint,
-            'old_state': old_state,
-            'new_state': new_state
-        })
+        if old_state != new_state:
+            self.add_to_history({
+                'type': 'waypoint_edit', 'waypoint': waypoint,
+                'old_state': old_state, 'new_state': new_state,
+            })
 
     def handle_landmark_edited(self, landmark):
         """ランドマーク編集時の処理"""
-        if self.origin_point:
-            origin_x, origin_y = self.origin_point
-            landmark.update_metric_coordinates(origin_x, origin_y, self.resolution)
+        if self.map_geometry is not None:
+            landmark.bind_map(self.map_geometry)
         self.landmark_edited.emit(landmark)
         self.update_display()
 
     def enter_edit_mode(self, waypoint):
         """ウェイポイントの編集モードに入る"""
+        if self.map_geometry is None:
+            self.show_edit_message('先に地図YAMLを読み込んでください。')
+            return
         self.pgm_display.edit_mode = True
         self.pgm_display.editing_waypoint = waypoint
         self.pgm_display.setCursor(Qt.CursorShape.SizeAllCursor)
@@ -3360,48 +3339,52 @@ class ImageViewer(QWidget):
         return result
 
     def import_waypoints_from_yaml(self, yaml_data):
-        """YAMLデータからウェイポイントをインポート"""
-        if 'waypoints' not in yaml_data:
-            return
-
-        # 既存のウェイポイントをクリア
-        self.waypoints.clear()
+        """Validate the whole document before replacing the current waypoints."""
+        if not isinstance(yaml_data, dict) or not isinstance(yaml_data.get('waypoints'), list):
+            raise ValueError('Waypoint YAML must contain a waypoints list')
+        warning = check_frames(self.map_frame_id, yaml_data.get('frame_id'))
+        records = []
+        numbers = set()
+        for index, record in enumerate(yaml_data['waypoints'], 1):
+            if not isinstance(record, dict):
+                raise ValueError('Each waypoint must be a mapping')
+            number = record.get('number', index)
+            if isinstance(number, bool) or not isinstance(number, int) or number < 1 or number in numbers:
+                raise ValueError('Waypoint numbers must be unique positive integers')
+            numbers.add(number)
+            x = finite_number(record.get('x'), 'x')
+            y = finite_number(record.get('y'), 'y')
+            angle = finite_number(record.get('angle_radians'), 'angle_radians')
+            records.append((record, number, x, y, angle))
+        waypoints = []
         Waypoint.reset_counter()
-        
-        for wp_data in yaml_data['waypoints']:
-            try:
-                # ピクセル座標を計算
-                if self.origin_point and hasattr(self, 'resolution'):
-                    origin_x, origin_y = self.origin_point
-                    x_meters = wp_data['x'] * 20
-                    y_meters = wp_data['y'] * 20
-                    
-                    # メートル座標からピクセル座標に変換
-                    pixel_x = int(origin_x + x_meters)
-                    pixel_y = int(origin_y - y_meters)
-                    
-                    # 角度の取得
-                    angle = wp_data['angle_radians']
-                    
-                    # 新しいウェイポイントを作成
-                    waypoint = Waypoint(pixel_x, pixel_y, angle)
-                    waypoint.update_metric_coordinates(origin_x, origin_y, self.resolution)
-                    
-                    # 追加の属性をインポート
-                    for key, value in wp_data.items():
-                        if key not in ['number', 'x', 'y', 'angle_degrees', 'angle_radians']:
-                            waypoint.set_attribute(key, value)
-                    
-                    self.waypoints.append(waypoint)
-                    self.waypoint_added.emit(waypoint)
-            except KeyError as e:
-                print(f"Error importing waypoint: Missing key {e}")
-                continue
-            except Exception as e:
-                print(f"Error importing waypoint: {e}")
-                continue
-        
+        for record, number, x, y, angle in records:
+            waypoint = Waypoint(0, 0, angle)
+            waypoint.renumber(number)
+            waypoint.set_world_position(x, y)
+            if self.map_geometry is not None:
+                waypoint.bind_map(self.map_geometry)
+            waypoint._imported_fields = set(record)
+            for key, value in record.items():
+                if key not in ('number', 'x', 'y', 'angle_radians'):
+                    waypoint.set_attribute(key, deepcopy(value))
+            waypoint._last_edit_state = {'x': waypoint.x, 'y': waypoint.y, 'angle': waypoint.angle}
+            waypoints.append(waypoint)
+        Waypoint.counter = max(numbers, default=0)
+        self.waypoints = waypoints
+        self.waypoint_metadata = deepcopy({k: v for k, v in yaml_data.items() if k != 'waypoints'})
+        self.waypoint_format_at_import = deepcopy(format_manager.get_format())
+        self.history.clear()
+        self.current_index = -1
+        self.history_changed.emit(False, False)
+        self.exit_edit_mode()
+        self.pgm_display.temp_waypoint = None
+        self.waypoint_removed.emit(-1)
+        for waypoint in self.waypoints:
+            self.waypoint_added.emit(waypoint)
         self.update_display()
+        if warning:
+            self.show_edit_message(warning)
 
     def export_landmarks_data(self):
         """ランドマークをYAML/JSON向けの辞書に変換"""
@@ -3437,20 +3420,17 @@ class ImageViewer(QWidget):
         self.landmarks.clear()
         Landmark.reset_counter()
         self.landmark_removed.emit(-1)
-        origin_x, origin_y = self.origin_point
-
         for lm_data in data.get('landmarks', []):
             try:
-                x_meters = float(lm_data['x']) * 20
-                y_meters = float(lm_data['y']) * 20
-                pixel_x = int(origin_x + x_meters)
-                pixel_y = int(origin_y - y_meters)
+                pixel_x, pixel_y = self.map_geometry.world_to_pixel(
+                    float(lm_data['x']), float(lm_data['y']))
                 angle = float(lm_data.get('yaw', lm_data.get('angle_radians', 0.0)))
                 name = str(lm_data.get('name', '')).strip() or None
 
                 landmark = Landmark(pixel_x, pixel_y, angle, name)
                 landmark.aliases = list(lm_data.get('aliases', []))
-                landmark.update_metric_coordinates(origin_x, origin_y, self.resolution)
+                landmark.set_world_position(lm_data['x'], lm_data['y'])
+                landmark.bind_map(self.map_geometry)
                 self.landmarks.append(landmark)
                 self.landmark_added.emit(landmark)
             except (KeyError, TypeError, ValueError) as e:
@@ -3535,12 +3515,9 @@ class ImageViewer(QWidget):
             # 以前の状態に戻す
             waypoint = action['waypoint']
             old_state = action['old_state']
-            waypoint.pixel_x = old_state['pixel_x']
-            waypoint.pixel_y = old_state['pixel_y']
-            waypoint.angle = old_state['angle']
-            if self.origin_point:
-                origin_x, origin_y = self.origin_point
-                waypoint.update_metric_coordinates(origin_x, origin_y, self.resolution)
+            waypoint.set_world_position(old_state['x'], old_state['y'])
+            waypoint.set_angle(old_state['angle'])
+            waypoint._last_edit_state = old_state.copy()
             self.waypoint_edited.emit(waypoint)
         elif action['type'] == 'draw':
             # 描画レイヤーを以前の状態に戻す
@@ -3557,6 +3534,7 @@ class ImageViewer(QWidget):
             self._costmap_revision += 1
             self._planning_cost_key = None
             
+        self.update_all_waypoint_coordinates()
         self.update_display()
         self.history_changed.emit(self.can_undo(), self.can_redo())
     
@@ -3582,12 +3560,9 @@ class ImageViewer(QWidget):
             # 新しい状態に進める
             waypoint = action['waypoint']
             new_state = action['new_state']
-            waypoint.pixel_x = new_state['pixel_x']
-            waypoint.pixel_y = new_state['pixel_y']
-            waypoint.angle = new_state['angle']
-            if self.origin_point:
-                origin_x, origin_y = self.origin_point
-                waypoint.update_metric_coordinates(origin_x, origin_y, self.resolution)
+            waypoint.set_world_position(new_state['x'], new_state['y'])
+            waypoint.set_angle(new_state['angle'])
+            waypoint._last_edit_state = new_state.copy()
             self.waypoint_edited.emit(waypoint)
         elif action['type'] == 'draw':
             # 描画レイヤーを新しい状態に進める
@@ -3604,6 +3579,7 @@ class ImageViewer(QWidget):
             self._costmap_revision += 1
             self._planning_cost_key = None
             
+        self.update_all_waypoint_coordinates()
         self.update_display()
         self.history_changed.emit(self.can_undo(), self.can_redo())
 
@@ -5396,34 +5372,20 @@ class MainWindow(QMainWindow):
             self.right_panel.update_layer_list(self.image_viewer.layers)
 
     def load_pgm_file(self, file_path):
-        """PGMファイルを読み込む
-        Parameters:
-            file_path (str): 読み込むPGMファイルのパス
-        """
+        """Load a PGM and its sibling YAML when available, without writing it."""
+        stem = os.path.splitext(file_path)[0]
+        for extension in ('.yaml', '.yml'):
+            if os.path.isfile(stem + extension):
+                return self.load_yaml_file(stem + extension)
         try:
-            with open(file_path, 'rb') as f:
-                magic = f.readline().decode('ascii').strip()
-                if (magic != 'P5'):
-                    raise ValueError('Not a P5 PGM file')
-
-                while True:
-                    line = f.readline().decode('ascii').strip()
-                    if not line.startswith('#'):
-                        break
-                width, height = map(int, line.split())
-                max_val = int(f.readline().decode('ascii').strip())
-                
-                data = f.read()
-                img_array = np.frombuffer(data, dtype=np.uint8)
-                img_array = img_array.reshape((height, width))
-                
-                self.image_viewer.load_image(img_array, width, height)
-                print(f"Successfully loaded image: {width}x{height}, max value: {255}")
-
+            image, width, height = read_pgm_file(file_path)
+            if image is None or image.dtype != np.uint8:
+                raise ValueError('Expected an 8-bit P5 PGM image')
+            self.image_viewer.load_image(image, width, height)
+            self.menu_panel.file_name_label.setText(os.path.basename(file_path))
+            self.image_viewer.show_edit_message('地図YAML未読込: 解像度・原点・座標系は未設定です。')
         except Exception as e:
-            print(f"Error loading PGM file: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            QMessageBox.warning(self, 'Error', f'Error loading PGM: {e}')
 
     def load_roadmap_file(self, file_path):
         """路面マッピング色付き地図を読み込む（原点合わせはJSONのresolution/origin）"""
@@ -5454,40 +5416,27 @@ class MainWindow(QMainWindow):
         self.menu_panel.zoom_label.setText(f"{zoom_percent}%")
 
     def load_yaml_file(self, file_path):
-        """YAMLファイルの読み込みとPGMファイルの自動読み込み"""
+        """Validate image, geometry and frames before committing a map change."""
         try:
-            # YAMLファイルを読み込む
             with open(file_path, 'r') as f:
-                yaml_data = yaml.safe_load(f)
-            
-            # YAMLファイルのディレクトリパスを取得
-            yaml_dir = os.path.dirname(file_path)
-            
-            # 画像ファイルのパスを取得し、関連するPGMファイルを読み込む
-            if 'image' in yaml_data:
-                pgm_filename = yaml_data['image']
-                # 相対パスの場合はYAMLファイルのディレクトリを基準に絶対パスを構築
-                if not os.path.isabs(pgm_filename):  # !を notに修正
-                    pgm_path = os.path.join(yaml_dir, pgm_filename)
-                else:
-                    pgm_path = pgm_filename
-                
-                # PGMファイルが存在する場合は読み込む
-                if os.path.exists(pgm_path):
-                    # ファイル名ラベルを更新
-                    self.menu_panel.file_name_label.setText(os.path.basename(pgm_path))
-                    # PGMファイルを読み込む
-                    self.load_pgm_file(pgm_path)
-                else:
-                    print(f"PGM file not found: {pgm_path}")
-            
-            # 原点情報などのYAMLデータを読み込む
-            self.image_viewer.load_yaml_file(file_path)
-            
+                data = yaml.safe_load(f)
+            validate_map_metadata(data)
+            map_frame = frame_id(data.get('frame_id') or os.environ.get('AMR_TOOLKIT_MAP_FRAME'))
+            check_frames(map_frame, self.image_viewer.waypoint_metadata.get('frame_id'))
+            image = None
+            if 'image' in data:
+                image_path = os.path.join(os.path.dirname(file_path), data['image'])
+                image, width, height = read_pgm_file(image_path)
+                if image is None or image.dtype != np.uint8:
+                    raise ValueError(f'Cannot load 8-bit P5 PGM: {image_path}')
+            elif not self.image_viewer.pgm_layer.pixmap:
+                raise ValueError('Map YAML has no image and no image is loaded')
+            if image is not None:
+                self.image_viewer.load_image(image, width, height)
+                self.menu_panel.file_name_label.setText(os.path.basename(image_path))
+            self.image_viewer.apply_map_metadata(data, file_path)
         except Exception as e:
-            print(f"Error loading YAML file: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            QMessageBox.warning(self, 'Error', f'Error loading map YAML: {e}')
 
     def handle_export(self, export_pgm, export_waypoints):
         """エクスポート処理"""
@@ -5526,23 +5475,17 @@ class MainWindow(QMainWindow):
                 yaml_file_name = os.path.splitext(file_name)[0] + '.yaml'
                 pgm_file_name = os.path.basename(file_name)
 
-                # YAMLデータの作成
-                yaml_data = {
-                    'image': pgm_file_name,
+                yaml_data = deepcopy(self.image_viewer.map_metadata) or {
                     'mode': 'trinary',
                     'resolution': self.image_viewer.resolution,
-                    'origin': [0, 0, 0],  # デフォルト値
+                    'origin': [0, 0, 0],
                     'negate': 0,
                     'occupied_thresh': 0.65,
-                    'free_thresh': 0.25
+                    'free_thresh': 0.25,
                 }
-
-                # 原点情報が存在する場合は更新
-                if self.image_viewer.origin_point:
-                    origin_x = -self.image_viewer.origin_point[0] * self.image_viewer.resolution
-                    origin_y = -(self.image_viewer.pgm_layer.pixmap.height() - 
-                               self.image_viewer.origin_point[1]) * self.image_viewer.resolution
-                    yaml_data['origin'] = [origin_x, origin_y, 0]
+                yaml_data['image'] = pgm_file_name
+                if self.image_viewer.map_frame_id is not None:
+                    yaml_data['frame_id'] = self.image_viewer.map_frame_id
 
                 # YAMLファイルを保存
                 try:
@@ -5638,6 +5581,34 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "Error", f"画像の保存に失敗しました:\n{file_name}")
 
+    def export_waypoints_data(self):
+        """Build the document without quantizing the stored world coordinates."""
+        viewer = self.image_viewer
+        current_format = format_manager.get_format()
+        preserve_imported = viewer.waypoint_format_at_import == current_format
+        data = deepcopy(viewer.waypoint_metadata)
+        if (viewer.waypoint_format_at_import != current_format
+                or 'format_version' not in data):
+            data['format_version'] = current_format['version']
+        records = []
+        for wp in viewer.waypoints:
+            record = {}
+            imported_fields = getattr(wp, '_imported_fields', set())
+            for key, type_info in current_format['format'].items():
+                value = self.get_waypoint_value(wp, key, type_info)
+                if value is not None:
+                    record[key] = value
+                elif key in imported_fields and key in wp.attributes:
+                    # Explicit false/zero/empty fields are part of the input data.
+                    record[key] = deepcopy(wp.attributes[key])
+            for key, value in wp.attributes.items():
+                if (preserve_imported and key in imported_fields
+                        and key not in current_format['format']):
+                    record[key] = deepcopy(value)
+            records.append(record)
+        data['waypoints'] = records
+        return data
+
     def export_waypoints_yaml(self):
         """ウェイポイントをYAMLファイルとしてエクスポート"""
         file_name, _ = QFileDialog.getSaveFileName(
@@ -5652,21 +5623,7 @@ class MainWindow(QMainWindow):
                 return dumper.represent_mapping('tag:yaml.org,2002:map', dict(data.items()))
             yaml.add_representer(OrderedDict, ordered_dict_representer)
             
-            waypoints_data = []
-            current_format = format_manager.get_format() # 現在のフォーマットを取得
-            
-            for wp in self.image_viewer.waypoints:
-                waypoint_data = {}
-                for key in current_format['format'].keys():
-                    value = self.get_waypoint_value(wp, key, current_format['format'][key])
-                    if value is not None:
-                        waypoint_data[key] = value
-                waypoints_data.append(waypoint_data)
-            
-            data = {
-                'format_version': current_format['version'],
-                'waypoints': waypoints_data
-            }
+            data = self.export_waypoints_data()
             
             try:
                 with open(file_name, 'w') as f:
@@ -5712,7 +5669,8 @@ class MainWindow(QMainWindow):
             current_format = format_manager.get_format()
             
             if 'format_version' in ordered_data:
-                if ordered_data['format_version'] != current_format['version']:
+                if (str(ordered_data['format_version']) not in ('1.0', '1.1')
+                        and ordered_data['format_version'] != current_format['version']):
                     response = QMessageBox.question(
                         self,
                         "Version Mismatch",
@@ -5780,11 +5738,11 @@ class MainWindow(QMainWindow):
         if key == 'number':
             return waypoint.number
         elif key == 'x':
-            return round(float(waypoint.x), 3)
+            return float(waypoint.x)
         elif key == 'y':
-            return round(float(waypoint.y), 3)
+            return float(waypoint.y)
         elif key == 'angle_radians':
-            return round(float(waypoint.angle), 3) 
+            return float(waypoint.angle)
         else:
             # カスタム属性の場合
             default_value = WAYPOINT_ATTRIBUTE_DEFAULTS.get(key, None)
@@ -6194,7 +6152,9 @@ class AttributeDialog(QDialog):
     
     def get_attributes(self):
         """ダイアログから属性を取得"""
-        attributes = {}
+        # Keep extension fields that the current format does not expose.
+        attributes = {key: deepcopy(value) for key, value in self.waypoint.attributes.items()
+                      if key not in self.format_data['format']}
         for i in range(self.attribute_layout.count()):
             layout_item = self.attribute_layout.itemAt(i)
             if layout_item and isinstance(layout_item, QHBoxLayout):
